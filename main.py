@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import logging
+import random
 from mcp.client.sse import sse_client
 from mcp import ClientSession
 from dotenv import load_dotenv
@@ -10,6 +11,9 @@ from typing import Any, Dict, Optional, List, Union
 import httpx
 from rich.console import Console
 from rich.table import Table
+import argparse
+
+from fedramp_compliance import KSICompliancer
 
 logging.basicConfig(
     level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -141,15 +145,26 @@ class MCPClient:
             command_list = "\n".join([f"- {cmd}" for cmd in available_commands])
 
             system_prompt = f"""
-                You are an Azure CLI expert. Translate the user's 
-                natural language query into the appropriate
-                Azure CLI command based on the available commands.
-        
+                You are a FedRAMP compliance assessor and Azure security expert. Translate the user's 
+                natural language query into the appropriate Azure CLI command based on the available commands.
+                
+                Focus on commands related to:
+                1. Security configurations and settings
+                2. Compliance with FedRAMP 20x KSIs (Key Security Indicators)
+                3. Identity and access management controls
+                4. Encryption and data protection settings
+                5. Network security and segmentation
+                6. Monitoring, logging, and security analytics
+                7. Backup and recovery configurations
+                
                 Available commands:
                 {command_list}
                 
-                Only return the suggested command and nothing else.
+                If the user asks about FedRAMP compliance, focus on commands that check security controls,
+                configurations, and settings that support FedRAMP compliance requirements. Prioritize
+                commands that relate to the security controls defined in the FedRAMP KSIs.
                 
+                Only return the suggested command and nothing else.
                 """
 
         try:
@@ -184,6 +199,30 @@ class MCPClient:
         except Exception as e:
             logger.error(f"Failed to translate query: {str(e)}")
             return natural_language_query
+
+    async def run_cli_command(self, cli_command: str) -> Any:
+        """Directly execute an Azure CLI command via MCP without natural language translation."""
+        try:
+            response = await self.session.call_tool(
+                name="azmcp-extension-az", arguments={"command": cli_command}
+            )
+            # Parse response
+            if hasattr(response, "result"):
+                return response.result
+            if hasattr(response, "content") and response.content:
+                for content_item in response.content:
+                    if hasattr(content_item, "text") and content_item.text:
+                        text = content_item.text
+                        if text == "null":
+                            return []
+                        try:
+                            return json.loads(text)
+                        except json.JSONDecodeError:
+                            return text
+            return None
+        except Exception as e:
+            logger.error(f"Failed to execute CLI command '{cli_command}': {e}")
+            return None
 
     def display_as_table(self, data: Any):
         """Display data as a table using all keys as headers."""
@@ -268,6 +307,43 @@ async def main():
     server_url = os.getenv("SERVER_URL")
     ollama_host = os.getenv("OLLAMA_HOST")
     ollama_model = os.getenv("OLLAMA_MODEL")
+    # Parse CLI arguments for compliance mode
+    parser = argparse.ArgumentParser(
+        description="Azure Terminal Copilot with FedRAMP compliance evaluation mode"
+    )
+    parser.add_argument(
+        "--evaluate-fedramp", action="store_true",
+        help="Evaluate FedRAMP 20x Phase One KSI compliance for a subscription"
+    )
+    parser.add_argument(
+        "--subscription", type=str,
+        help="Azure subscription ID to evaluate for compliance"
+    )
+    parser.add_argument(
+        "--output-format", type=str, choices=["table", "json", "csv"], default="table",
+        help="Output format for compliance results (default: table)"
+    )
+    parser.add_argument(
+        "--output-file", type=str,
+        help="Save results to specified file path (for json and csv formats)"
+    )
+    parser.add_argument(
+        "--categories", type=str, 
+        help="Comma-separated list of KSI categories to check (e.g., 'KSI-CNA,KSI-SC,KSI-IAM')"
+    )
+    parser.add_argument(
+        "--skip-manual", action="store_true",
+        help="Skip checks that require manual verification"
+    )
+    parser.add_argument(
+        "--concurrent-checks", type=int, default=5,
+        help="Maximum number of concurrent checks to run"
+    )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Show detailed progress information during checks"
+    )
+    args = parser.parse_args()
 
     if not server_url:
         print("ERROR: SERVER_URL environment variable not set")
@@ -286,6 +362,59 @@ async def main():
 
     try:
         await client.connect_to_server(server_url)
+        # If compliance evaluation mode is enabled, run FedRAMP KSIs and exit
+        if args.evaluate_fedramp:
+            if not args.subscription:
+                print("ERROR: --subscription is required for FedRAMP compliance evaluation")
+                return
+                
+            print(f"\n► Evaluating subscription {args.subscription} for FedRAMP 20x KSI compliance...\n")
+            
+            # Validate output format and file options
+            output_format = args.output_format.lower()
+            if args.output_file and output_format == "table":
+                print("WARNING: --output-file is ignored when using table format")
+                
+            if output_format in ["json", "csv"] and not args.output_file:
+                print(f"NOTE: Results will be displayed in {output_format} format. Use --output-file to save to a file.")
+            
+            # Build configuration
+            config = {
+                "include_manual_checks": not args.skip_manual,
+                "max_concurrent_checks": args.concurrent_checks,
+                "verbose": args.verbose
+            }
+            
+            # Parse categories if specified
+            if args.categories:
+                categories = [cat.strip() for cat in args.categories.split(',')]
+                # Validate categories
+                valid_categories = ["KSI-CNA", "KSI-SC", "KSI-IAM", "KSI-MLA", "KSI-CM", "KSI-PI", "KSI-3IR", "KSI-CE", "KSI-IR"]
+                invalid_categories = [c for c in categories if c not in valid_categories]
+                
+                if invalid_categories:
+                    print(f"WARNING: Ignoring invalid categories: {', '.join(invalid_categories)}")
+                    categories = [c for c in categories if c in valid_categories]
+                    
+                if not categories:
+                    print("ERROR: No valid categories specified")
+                    return
+                    
+                config["include_categories"] = categories
+            
+            # Initialize and run the evaluator
+            evaluator = KSICompliancer(client, args.subscription, output_format, config)
+            await evaluator.evaluate()
+            
+            # Export to file if specified
+            if args.output_file and output_format in ["json", "csv"]:
+                if output_format == "json":
+                    evaluator.export_results_json(args.output_file)
+                elif output_format == "csv":
+                    evaluator.export_results_csv(args.output_file)
+                print(f"\nResults saved to {args.output_file}")
+                
+            return
 
         if ollama_available:
             print("\n✓ Ollama is available for natural language processing")
@@ -295,6 +424,18 @@ async def main():
                 "\n⚠️ Ollama is not available. Natural language queries will be sent directly to Azure."
             )
 
+        # Show FedRAMP examples
+        fedramp_examples = [
+            "What resources meet FedRAMP KSI-CNA requirements for DoS protection?",
+            "How do I check if my storage accounts are compliant with FedRAMP encryption requirements?",
+            "List Azure resources required for FedRAMP MFA compliance",
+            "Show me all resources with diagnostic settings for FedRAMP monitoring",
+            "What Azure policies help with FedRAMP compliance?",
+            "How can I implement immutable deployments for FedRAMP CM requirements?",
+            "List all NSGs for FedRAMP network security compliance",
+            "Show me my backup vaults for FedRAMP incident response compliance"
+        ]
+        
         while True:
             print("\n" + "=" * 50)
             if ollama_available:
@@ -304,6 +445,11 @@ async def main():
                 print(
                     "Example: 'list my resource groups' or 'show my storage accounts'"
                 )
+                
+                # Show FedRAMP example once in a while (every 3rd prompt)
+                if random.randint(1, 3) == 1:
+                    example = random.choice(fedramp_examples)
+                    print(f"FedRAMP Example: '{example}'")
             else:
                 print("Enter Azure CLI command (or 'exit' to quit)")
                 print("Example: 'group list' or 'storage account list'")
